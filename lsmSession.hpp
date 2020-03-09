@@ -9,6 +9,8 @@
 #include <boost/filesystem.hpp>
 #include <boost/core/ignore_unused.hpp>
 
+using namespace std::chrono_literals;
+
 namespace lsm{
     namespace fs=boost::filesystem;
     typedef enum{
@@ -105,6 +107,9 @@ namespace lsm{
 
         bool isOccupied_ { false };
 
+        boost::asio::steady_timer m_timer;
+        std::chrono::milliseconds m_duration { 100ms };
+
     public:
         controller(int dt, int p, int i, int d, adc& adcHandle, pwm& pwmHandle, unsigned int innerEndPosition, unsigned int outerEndPosition)
            :    Kp_(p), 
@@ -121,6 +126,7 @@ namespace lsm{
             std::clog   << "Controller initialized with P="
                         << Kp_ << ", I=" << Ki_ << ", D=" << Kd_ << std::endl;
         }
+
         int calculateMeasuredError(unsigned int setpoint, int reference)
         {
             return (setpoint - reference);
@@ -167,6 +173,22 @@ namespace lsm{
             return measuredError;
         }
 
+        bool start() {
+            if (isOccupied_)
+                return false;
+
+            isOccupied_ = true;
+            m_timer.expires_after(m_duration);
+            m_timer.async_wait([this](const boost::system::error_code& error){
+                if(!error ) {
+                      /* if method has not finished, start timer again */
+                    if (runToSetpoint(1) < 2)
+                        start();
+                    else
+                        isOccupied_ = false;
+                } });
+
+        }
         bool isOccupied() {
             return isOccupied_;
         }
