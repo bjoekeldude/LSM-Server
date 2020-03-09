@@ -44,24 +44,24 @@ struct server{
 public: 
     server(boost::asio::io_context& io_context, short port, std::shared_ptr<lsm::controller> controllerInstance)
 		: acceptor_(io_context, bait::tcp::endpoint(bait::tcp::v4(), port)),
-		socket_(io_context)
+		socket_(std::make_shared<bait::tcp::socket>(io_context))
 	{
 		doAccept();
 	}
 
 private:
 	void doAccept(){
-		acceptor_.async_accept(socket_,
+		acceptor_.async_accept(*socket_,
 			[this](boost::system::error_code ec)
 		{
 			if(!ec){
-                std::make_shared<lsm::session>(std::move(socket_), controller)->start();
+                std::make_shared<lsm::session>(socket_, controller)->start();
 			}
 			doAccept();
 		});
 	}
 	bait::tcp::acceptor acceptor_;
-	bait::tcp::socket socket_;
+	std::shared_ptr<bait::tcp::socket> socket_;
   std::shared_ptr<lsm::controller> controller;
 };
 

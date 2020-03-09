@@ -4,7 +4,6 @@
 #include <utility>
 #include <boost/asio.hpp>
 #include <string>
-#include <string_view>
 #include <array>
 #include <fstream>
 #include <boost/filesystem.hpp>
@@ -19,7 +18,9 @@ namespace lsm{
     //magic constant. could also be larger but needn't to
     //be in this case
     constexpr int maxInputBufferLength{1024};
-    std::string_view epicsProtocolTerminator="X";
+    constexpr char epicsProtocolTerminator='X';
+    constexpr char epicsCommandDelimiter=':';
+    constexpr int epsilon{100};
     
     //encapsulates an instance of adc hardware on BBB
     //could be templated to be generic for different 
@@ -188,24 +189,35 @@ namespace lsm{
 
         int iterateToSetpoint(unsigned int setpoint)
         {
-            int reference = static_cast<int>(adcHandle_.getRAWValue());
-            int measuredError = calculateMeasuredError(setpoint, reference);
-            int systemInput = calculateSystemInput(measuredError);
-            int direction = decideDirection(systemInput);
+            const int reference = static_cast<int>(adcHandle_.getRAWValue());
+            const int measuredError = calculateMeasuredError(setpoint, reference);
+            const int systemInput = calculateSystemInput(measuredError);
+            const int direction = decideDirection(systemInput);
             pwmHandle_.update(direction, systemInput);
             
             return measuredError;
         }
-        int start(command_t command, std::function<void(const std::string&)>&& returnVal)
+
+        void handleDisplacement(const int displacement)
         {
-            ackFunction_ = std::move(returnVal);
-            if(isOccupied_) return -1;
-            setpoint_ = std::get<1>(command);
-            int currentPosition = iterateToSetpoint(setpoint_);
-            if(100<currentPosition){
+            if (epsilon < std::abs(displacement)){
                 isOccupied_ = true;
                 start();
             }
+            else{
+                isOccupied_ = false;
+                std::string message = "Done, final displacement=" + std::to_string(displacement);
+                if(ackFunction_)ackFunction_(message);
+            }
+        }
+
+        int start(command_t command, std::function<void(const std::string&)>&& returnVal)
+        {
+            ackFunction_ = std::move(returnVal);
+            if(isOccupied_) throw "started but occupied";
+            setpoint_ = std::get<1>(command);
+            const int currentDisplacement = iterateToSetpoint(setpoint_);
+            handleDisplacement(currentDisplacement);
             return adcHandle_.getRAWValue();
             
         }
@@ -214,17 +226,9 @@ namespace lsm{
             m_timer.expires_after(m_duration);
             m_timer.async_wait([this](const boost::system::error_code& error){
                 if(!error ) {
-                    int currentPosition = iterateToSetpoint(setpoint_); 
-                    if (100<currentPosition)
-                        start();
-                        
-                    else{
-                        isOccupied_ = false;
-                        std::string message = "Done " + std::to_string(currentPosition);
-                        if(ackFunction_)ackFunction_(message);
-                        
-                    }
-                } 
+                    const int currentDisplacement = iterateToSetpoint(setpoint_); 
+                    handleDisplacement(currentDisplacement);    
+                }
             });
             return adcHandle_.getRAWValue();
         }
@@ -242,8 +246,8 @@ namespace lsm{
     {
         using bait = boost::asio::ip::tcp;
     public: 
-        session(bait::tcp::socket socket, std::shared_ptr<controller> controllerInstance)
-            : socket_(std::move(socket)), controller_(controllerInstance)
+        session(std::shared_ptr<bait::tcp::socket> socket, std::shared_ptr<controller> controllerInstance)
+            : socket_(socket), controller_(controllerInstance)
         {
         }
 
@@ -253,13 +257,16 @@ namespace lsm{
 
     private:
         command_t makeCommandFromEpicsProtocol(std::array<char, 1024> inputData){
-            std::string inputString(std::begin(inputData), std::end(inputData));
-            std::string commandostring {inputString.erase(inputString.find(epicsProtocolTerminator))};
-            return std::make_tuple(commandostring,1);
+            auto terminator     = std::find(std::begin(inputData),  std::end(inputData),    epicsProtocolTerminator);
+            auto delimiter      = std::find(std::begin(inputData),  std::end(inputData),    epicsCommandDelimiter);
+            std::string commandostring(std::begin(inputData),delimiter);
+            std::string valueString(    delimiter+1,    terminator);
+            int commandvalue = std::stoi(valueString);
+            return std::make_tuple(commandostring,commandvalue);
         }
         void acknowledge(std::string ackmessage){
             auto self(shared_from_this());
-            boost::asio::async_write(socket_, boost::asio::buffer(ackmessage),
+            boost::asio::async_write(*socket_, boost::asio::buffer(ackmessage),
                     [this, self](boost::system::error_code ec, std::size_t /*length*/)
                     {
                         if(ec.value()){
@@ -270,7 +277,7 @@ namespace lsm{
 
         void doWrite(std::size_t length){
             auto self(shared_from_this());
-            boost::asio::async_write(socket_, boost::asio::buffer(data_, length),
+            boost::asio::async_write(*socket_, boost::asio::buffer(data_, length),
                     [this, self](boost::system::error_code ec, std::size_t /*length*/)
             {
                 if(!ec){
@@ -281,14 +288,16 @@ namespace lsm{
 
         void doRead(){
             auto self(shared_from_this());
-            socket_.async_read_some(boost::asio::buffer(data_),
+            socket_->async_read_some(boost::asio::buffer(data_),
                     [this, self](boost::system::error_code ec, std::size_t length)
             {
                 boost::ignore_unused(length);
                 command_t command = makeCommandFromEpicsProtocol(data_);
-                if (controller_->isOccupied()) {
+                                
+                if (!controller_->isOccupied()) {
                     if(!ec){
-                        acknowledge("Roger that\n");
+                        acknowledge("RogerThatX");
+                        //put switch here for different drive modi
                         controller_->start(command, [this,self](const std::string& message)
                                                             {acknowledge(message);});
                         
@@ -300,9 +309,7 @@ namespace lsm{
             });
         }
 
-        //enum status;
-    
-        bait::tcp::socket socket_;
+        std::shared_ptr<bait::tcp::socket> socket_;
         std::shared_ptr<controller> controller_;
         std::array<char, maxInputBufferLength> data_;
     };
