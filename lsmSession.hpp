@@ -4,21 +4,25 @@
 #include <utility>
 #include <boost/asio.hpp>
 #include <string>
+#include <string_view>
 #include <array>
 #include <fstream>
-#include <filesystem>
+#include <boost/filesystem.hpp>
+#include <tuple>
+#include <boost/core/ignore_unused.hpp>
 
+using namespace std::chrono_literals;
 
 namespace lsm{
-    namespace fs=std::filesystem;
+    namespace fs=boost::filesystem;
     typedef enum{
         idle,
         busy,
         error
     } state;
     constexpr int maxInputBufferLength{1024};
-    std::string epicsProtocolTerminator{"X"};
-      
+    std::string/*_view*/ epicsProtocolTerminator="X";
+    using command_t = std::tuple<std::string, int>;
     struct adc
     {
     private:
@@ -34,7 +38,7 @@ namespace lsm{
         adc(fs::path path, int scalingFactor=1, std::string egu="counts")
             :   sysfspath_(path), scalingFactor_(scalingFactor), egu_(egu)
         {
-            adcHandle_.open(sysfspath_, std::fstream::in);
+            adcHandle_.open(sysfspath_.c_str(), std::fstream::in);
         }
         unsigned int getRAWValue()
         {
@@ -71,10 +75,10 @@ namespace lsm{
         pwm(fs::path pwmPath, int periode = 100000000)
            : sysfspath_(pwmPath), periodeVal_(periode)
         {
-            DutyCycleHandle_.open   (DutyCycle_,    std::fstream::out);
-            PeriodHandle_.open      (Period_,       std::fstream::out);
-            PolarityHandle_.open    (Polarity_,     std::fstream::out);
-            EnableHandle_.open      (Enable_,       std::fstream::out);
+            DutyCycleHandle_.open   (DutyCycle_.c_str(),    std::fstream::out);
+            PeriodHandle_.open      (Period_.c_str(),       std::fstream::out);
+            PolarityHandle_.open    (Polarity_.c_str(),     std::fstream::out);
+            EnableHandle_.open      (Enable_.c_str(),       std::fstream::out);
             
             setProperty(DutyCycleHandle_,0);
             setProperty(PeriodHandle_,periodeVal_);
@@ -102,22 +106,14 @@ namespace lsm{
         int integral_;
         int preError_;
         int dt_;
-    public:
-        controller(int dt, int p, int i, int d, adc& adcHandle, pwm& pwmHandle, unsigned int innerEndPosition, unsigned int outerEndPosition)
-           :    Kp_(p), 
-                Ki_(i), 
-                Kd_(d),
-                adcHandle_(adcHandle),
-                pwmHandle_(pwmHandle),
-                innerEndPosition_(innerEndPosition),
-                outerEndPosition_(outerEndPosition),
-                integral_(0),
-                preError_(0),
-                dt_(dt)
-        {
-            std::clog   << "Controller initialized with P="
-                        << Kp_ << ", I=" << Ki_ << ", D=" << Kd_ << std::endl;
-        }
+        int setpoint_;
+
+        bool isOccupied_ { false };
+
+        boost::asio::steady_timer m_timer;
+        std::chrono::milliseconds m_duration;
+        std::function<void (const std::string&)> ackFunction_; 
+
         int calculateMeasuredError(unsigned int setpoint, int reference)
         {
             return (setpoint - reference);
@@ -148,19 +144,70 @@ namespace lsm{
             else return 0;
         }
 
+    public:
+        controller(boost::asio::io_context& context, int p, int i, int d, adc& adcHandle, pwm& pwmHandle, unsigned int innerEndPosition, unsigned int outerEndPosition, unsigned int dt)
+           :    Kp_(p), 
+                Ki_(i), 
+                Kd_(d),
+                adcHandle_(adcHandle),
+                pwmHandle_(pwmHandle),
+                innerEndPosition_(innerEndPosition),
+                outerEndPosition_(outerEndPosition),
+                integral_(0),
+                preError_(0),
+                dt_(dt),
+                m_timer(context),
+                m_duration(dt)
+        {
+            std::clog   << "Controller initialized with P="
+                        << Kp_ << ", I=" << Ki_ << ", D=" << Kd_ << std::endl;
+        }
+
         int runToSetpoint(unsigned int setpoint)
         {
-            int reference = adcHandle_.getRAWValue();
+            int reference = static_cast<int>(adcHandle_.getRAWValue());
             int measuredError = calculateMeasuredError(setpoint, reference);
-            if(100<measuredError)
-            {
-                int systemInput = calculateSystemInput(measuredError);
-                int direction = decideDirection(systemInput);
-                pwmHandle_.update(direction, systemInput);
-                //wait
-                //start over again
+            int systemInput = calculateSystemInput(measuredError);
+            int direction = decideDirection(systemInput);
+            pwmHandle_.update(direction, systemInput);
+            
+            return measuredError;
+        }
+        int start(command_t command, std::function<void(const std::string&)>&& returnVal)
+        {
+            ackFunction_ = std::move(returnVal);
+            if(isOccupied_) return -1;
+            setpoint_ = std::get<1>(command);
+            int currentPosition = runToSetpoint(setpoint_);
+            if(100<currentPosition){
+                isOccupied_ = true;
+                start();
             }
-            else return measuredError;
+            return adcHandle_.getRAWValue();
+            
+        }
+
+        int start() {
+            m_timer.expires_after(m_duration);
+            m_timer.async_wait([this](const boost::system::error_code& error){
+                if(!error ) {
+                    int currentPosition = runToSetpoint(setpoint_); 
+                    if (100<currentPosition)
+                        start();
+                        
+                    else{
+                        isOccupied_ = false;
+                        std::string message = "Done " + std::to_string(currentPosition);
+                        if(ackFunction_)ackFunction_(message);
+                        
+                    }
+                } 
+            });
+            return adcHandle_.getRAWValue();
+        }
+
+        bool isOccupied() {
+            return isOccupied_;
         }
     };
 
@@ -168,11 +215,11 @@ namespace lsm{
     : public std::enable_shared_from_this<session>
     {
         using bait = boost::asio::ip::tcp;
-        using command_t = std::string;
+        
 
     public: 
-        session(bait::tcp::socket socket)
-            : socket_(std::move(socket))
+        session(bait::tcp::socket socket, std::shared_ptr<controller> controllerInstance)
+            : socket_(std::move(socket)), controller_(controllerInstance)
         {
         }
 
@@ -183,11 +230,8 @@ namespace lsm{
     private:
         command_t makeCommandFromEpicsProtocol(std::array<char, 1024> inputData){
             std::string inputString(std::begin(inputData), std::end(inputData));
-            return command_t{inputString.erase(inputString.find(epicsProtocolTerminator))};
-        }
-
-        void actOutCommand(command_t command){
-
+            std::string commandostring {inputString.erase(inputString.find(epicsProtocolTerminator))};
+            return std::make_tuple(commandostring,1);
         }
         void acknowledge(std::string ackmessage){
             auto self(shared_from_this());
@@ -199,6 +243,7 @@ namespace lsm{
                         }
                     });
         }
+
         void doWrite(std::size_t length){
             auto self(shared_from_this());
             boost::asio::async_write(socket_, boost::asio::buffer(data_, length),
@@ -209,20 +254,32 @@ namespace lsm{
                 }
             });
         }
+
         void doRead(){
             auto self(shared_from_this());
             socket_.async_read_some(boost::asio::buffer(data_),
                     [this, self](boost::system::error_code ec, std::size_t length)
-            
             {
-                makeCommandFromEpicsProtocol(data_);
-                if(!ec){
-                    acknowledge("Roger that\n");
+                boost::ignore_unused(length);
+                command_t command = makeCommandFromEpicsProtocol(data_);
+                if (controller_->isOccupied()) {
+                    if(!ec){
+                        acknowledge("Roger that\n");
+                        controller_->start(command, [this,self](const std::string& message)
+                                                            {acknowledge(message);});
+                        
+                    }
+
                 }
+                    else
+                    acknowledge("I am occupied\n");
             });
         }
+
         //enum status;
+    
         bait::tcp::socket socket_;
+        std::shared_ptr<controller> controller_;
         std::array<char, maxInputBufferLength> data_;
     };
 }
