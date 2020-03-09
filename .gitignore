@@ -1,0 +1,5 @@
+*.out
+Makefile
+*.cmake
+CMakeFiles/
+CMakeCache*
