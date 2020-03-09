@@ -4,35 +4,42 @@
 #include <boost/filesystem.hpp>
 #include <string>
 #include "lsmSession.hpp"
-
-//configuring the paths to sysfs
-namespace fs = boost::filesystem;
-fs::path systemsAdc		="/sys/bus/iio/devices/iio:device0/in_voltage0_raw";
-fs::path systemsPwm		="/sys/class/pwm/pwm-3:0/";
-
-
 using bait = boost::asio::ip::tcp;
 
-class PortException
-   : public std::exception
-{
-  virtual const char* what() const throw()
+//configuring the paths to sysfs
+namespace config{
+  namespace fs = boost::filesystem;
+  fs::path systemsAdc		="/sys/bus/iio/devices/iio:device0/in_voltage0_raw";
+  fs::path systemsPwm		="/sys/class/pwm/pwm-3:0/";
+  constexpr int Kp{1};
+  constexpr int Ki{1};
+  constexpr int Kd{0};
+  constexpr int controllerRefreshDelayMs{100};
+  constexpr int innerEndpointKalibration{2700};
+  constexpr int outerEndpointKalibration{100};
+}
+namespace error{
+  class PortException
+    : public std::exception
   {
-    return "Invalid Port Number - Port must be greater than 0 and less than 65535";
-  }
-} wrongPortException;
+    virtual const char* what() const throw()
+    {
+      return "Invalid Port Number - Port must be greater than 0 and less than 65535";
+    }
+  } wrongPortException;
 
-class InvokationException
-   : public std::exception
-{
-  virtual const char* what() const throw()
+  class InvokationException
+    : public std::exception
   {
-    return "Illegal invokation - Try asioLSMserver <port to listen to>";
-  }
-} illegalInvokationException;
+    virtual const char* what() const throw()
+    {
+      return "Illegal invokation - Try asioLSMserver <port to listen to>";
+    }
+  } illegalInvokationException;
+}
 
-
-
+//server launches a controller-session for incoming connections
+//meanwhile it waits in doAccept() function.... idling
 struct server{
 public: 
     server(boost::asio::io_context& io_context, short port, std::shared_ptr<lsm::controller> controllerInstance)
@@ -55,20 +62,29 @@ private:
 	}
 	bait::tcp::acceptor acceptor_;
 	bait::tcp::socket socket_;
-    std::shared_ptr<lsm::controller> controller;
+  std::shared_ptr<lsm::controller> controller;
 };
 
 int main(int argc, char* argv[]){
 
-    if(argc != 2) throw illegalInvokationException;
+    if(argc != 2) throw error::illegalInvokationException;
 
     try{
         boost::asio::io_context io_context;
-        lsm::adc adc(systemsAdc);
-        lsm::pwm pwm(systemsPwm);
-        auto controllerInstance = std::make_shared<lsm::controller>(io_context,1,1,1,adc,pwm,2700,100, 100);
+        lsm::adc adc(config::systemsAdc);
+        lsm::pwm pwm(config::systemsPwm);
+        auto controllerInstance = std::make_shared<lsm::controller>
+                  (io_context,
+                  config::Kp,
+                  config::Ki,
+                  config::Kd,
+                  adc,
+                  pwm,
+                  config::innerEndpointKalibration,
+                  config::outerEndpointKalibration, 
+                  config::controllerRefreshDelayMs);
         int port{std::atoi(argv[1])};
-        if(1>port || 65535<port) throw wrongPortException;
+        if(1>port || 65535<port) throw error::wrongPortException;
         server s(io_context, port, controllerInstance);
         io_context.run();
     }
