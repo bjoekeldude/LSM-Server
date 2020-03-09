@@ -6,18 +6,18 @@
 #include <string>
 #include <array>
 #include <fstream>
-#include <filesystem>
-
+#include <boost/filesystem.hpp>
+#include <boost/core/ignore_unused.hpp>
 
 namespace lsm{
-    namespace fs=std::filesystem;
+    namespace fs=boost::filesystem;
     typedef enum{
         idle,
         busy,
         error
     } state;
     constexpr int maxInputBufferLength{1024};
-    std::string epicsProtocolTerminator{"X"};
+    constexpr std::string_view epicsProtocolTerminator{"X"};
       
     struct adc
     {
@@ -34,7 +34,7 @@ namespace lsm{
         adc(fs::path path, int scalingFactor=1, std::string egu="counts")
             :   sysfspath_(path), scalingFactor_(scalingFactor), egu_(egu)
         {
-            adcHandle_.open(sysfspath_, std::fstream::in);
+            adcHandle_.open(sysfspath_.c_str(), std::fstream::in);
         }
         unsigned int getRAWValue()
         {
@@ -71,10 +71,10 @@ namespace lsm{
         pwm(fs::path pwmPath, int periode = 100000000)
            : sysfspath_(pwmPath), periodeVal_(periode)
         {
-            DutyCycleHandle_.open   (DutyCycle_,    std::fstream::out);
-            PeriodHandle_.open      (Period_,       std::fstream::out);
-            PolarityHandle_.open    (Polarity_,     std::fstream::out);
-            EnableHandle_.open      (Enable_,       std::fstream::out);
+            DutyCycleHandle_.open   (DutyCycle_.c_str(),    std::fstream::out);
+            PeriodHandle_.open      (Period_.c_str(),       std::fstream::out);
+            PolarityHandle_.open    (Polarity_.c_str(),     std::fstream::out);
+            EnableHandle_.open      (Enable_.c_str(),       std::fstream::out);
             
             setProperty(DutyCycleHandle_,0);
             setProperty(PeriodHandle_,periodeVal_);
@@ -102,6 +102,9 @@ namespace lsm{
         int integral_;
         int preError_;
         int dt_;
+
+        bool isOccupied_ { false };
+
     public:
         controller(int dt, int p, int i, int d, adc& adcHandle, pwm& pwmHandle, unsigned int innerEndPosition, unsigned int outerEndPosition)
            :    Kp_(p), 
@@ -150,7 +153,7 @@ namespace lsm{
 
         int runToSetpoint(unsigned int setpoint)
         {
-            int reference = adcHandle_.getRAWValue();
+            int reference = static_cast<int>(adcHandle_.getRAWValue());
             int measuredError = calculateMeasuredError(setpoint, reference);
             if(100<measuredError)
             {
@@ -160,7 +163,12 @@ namespace lsm{
                 //wait
                 //start over again
             }
-            else return measuredError;
+            // JS: else needed here?
+            return measuredError;
+        }
+
+        bool isOccupied() {
+            return isOccupied_;
         }
     };
 
@@ -171,8 +179,8 @@ namespace lsm{
         using command_t = std::string;
 
     public: 
-        session(bait::tcp::socket socket)
-            : socket_(std::move(socket))
+        session(bait::tcp::socket socket, std::shared_ptr<controller> controllerInstance)
+            : socket_(std::move(socket)), controller_(controllerInstance)
         {
         }
 
@@ -187,6 +195,7 @@ namespace lsm{
         }
 
         void actOutCommand(command_t command){
+            boost::ignore_unused(command);
 
         }
         void acknowledge(std::string ackmessage){
@@ -199,6 +208,7 @@ namespace lsm{
                         }
                     });
         }
+
         void doWrite(std::size_t length){
             auto self(shared_from_this());
             boost::asio::async_write(socket_, boost::asio::buffer(data_, length),
@@ -209,20 +219,29 @@ namespace lsm{
                 }
             });
         }
+
         void doRead(){
             auto self(shared_from_this());
             socket_.async_read_some(boost::asio::buffer(data_),
                     [this, self](boost::system::error_code ec, std::size_t length)
-            
             {
+                boost::ignore_unused(length);
+
+                if (controller_->isOccupied()) {
+
                 makeCommandFromEpicsProtocol(data_);
                 if(!ec){
                     acknowledge("Roger that\n");
                 }
+                }
+                else
+                    acknowledge("I am occupied\n");
             });
         }
+
         //enum status;
         bait::tcp::socket socket_;
+        std::shared_ptr<controller> controller_;
         std::array<char, maxInputBufferLength> data_;
     };
 }
