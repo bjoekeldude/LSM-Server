@@ -111,7 +111,7 @@ namespace lsm{
         std::chrono::milliseconds m_duration { 100ms };
 
     public:
-        controller(int dt, int p, int i, int d, adc& adcHandle, pwm& pwmHandle, unsigned int innerEndPosition, unsigned int outerEndPosition)
+        controller(boost::asio::io_context& context, int dt, int p, int i, int d, adc& adcHandle, pwm& pwmHandle, unsigned int innerEndPosition, unsigned int outerEndPosition)
            :    Kp_(p), 
                 Ki_(i), 
                 Kd_(d),
@@ -121,7 +121,8 @@ namespace lsm{
                 outerEndPosition_(outerEndPosition),
                 integral_(0),
                 preError_(0),
-                dt_(dt)
+                dt_(dt),
+                m_timer(context)
         {
             std::clog   << "Controller initialized with P="
                         << Kp_ << ", I=" << Ki_ << ", D=" << Kd_ << std::endl;
